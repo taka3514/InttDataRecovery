@@ -1,0 +1,1205 @@
+#include "SingleMicromegasPoolInput_v2.h"
+
+#include "Fun4AllStreamingInputManager.h"
+#include "InputManagerType.h"
+
+#include <qautils/QAHistManagerDef.h>
+#include <qautils/QAUtil.h>
+
+#include <ffarawobjects/MicromegasRawHitContainerv3.h>
+#include <ffarawobjects/MicromegasRawHitv3.h>
+
+#include <fun4all/Fun4AllHistoManager.h>
+#include <fun4all/InputFileHandlerReturnCodes.h>
+
+#include <phool/PHCompositeNode.h>
+#include <phool/PHNodeIterator.h>  // for PHNodeIterator
+#include <phool/getClass.h>
+#include <phool/phool.h>
+
+#include <Event/Event.h>
+#include <Event/EventTypes.h>
+#include <Event/Eventiterator.h>
+#include <Event/fileEventiterator.h>
+#include <Event/oncsSubConstants.h>
+
+#include <TFile.h>
+#include <TH1.h>
+#include <TTree.h>
+
+#include <algorithm>
+#include <bitset>
+
+namespace
+{
+  // maximum number of packets
+  constexpr int m_npackets_active = 2;
+
+  //! number of sampa chips per fee board
+  constexpr int m_nsampa_fee = 8;
+
+  //! number of fee boards
+  constexpr int m_nfee_max = 26;
+
+  /* see: https://git.racf.bnl.gov/gitea/Instrumentation/sampa_data/src/branch/fmtv2/README.md */
+  enum SampaDataType
+  {
+    HEARTBEAT_T = 0b000,
+    TRUNCATED_DATA_T = 0b001,
+    TRUNCATED_TRIG_EARLY_DATA_T = 0b011,
+    NORMAL_DATA_T = 0b100,
+    LARGE_DATA_T = 0b101,
+    TRIG_EARLY_DATA_T = 0b110,
+    TRIG_EARLY_LARGE_DATA_T = 0b111,
+  };
+
+  /* see: https://git.racf.bnl.gov/gitea/Instrumentation/sampa_data/src/branch/fmtv2/README.md */
+  enum ModeBitType
+  {
+    BX_COUNTER_SYNC_T = 0,
+    ELINK_HEARTBEAT_T = 1,
+    SAMPA_EVENT_TRIGGER_T = 2,
+    CLEAR_LV1_LAST_T = 6,
+    CLEAR_LV1_ENDAT_T = 7
+  };
+
+  constexpr uint16_t FEE_PACKET_MAGIC_KEY_1 = 0xfe;
+  constexpr uint16_t FEE_PACKET_MAGIC_KEY_2 = 0xed;
+
+  constexpr uint16_t FEE_MAGIC_KEY = 0xba00;
+  constexpr uint16_t GTM_MAGIC_KEY = 0xbb00;
+  constexpr uint16_t GTM_LVL1_ACCEPT_MAGIC_KEY = 0xbbf0;
+  constexpr uint16_t GTM_ENDAT_MAGIC_KEY = 0xbbf1;
+  constexpr uint16_t GTM_MODEBIT_MAGIC_KEY = 0xbbf2;
+
+  // header length
+  constexpr uint16_t HEADER_LENGTH = 7;
+
+  // packet length
+  constexpr uint16_t MAX_PACKET_LENGTH = 1025;
+
+  //_____________________________________________________________
+  [[maybe_unused]] uint16_t reverseBits(const uint16_t& x)
+  {
+    uint16_t n = x;
+    n = ((uint16_t) (n >> 1U) & 0x55555555U) | ((uint16_t) (n << 1U) & 0xaaaaaaaaU);
+    n = ((uint16_t) (n >> 2U) & 0x33333333U) | ((uint16_t) (n << 2U) & 0xccccccccU);
+    n = ((uint16_t) (n >> 4U) & 0x0f0f0f0fU) | ((uint16_t) (n << 4U) & 0xf0f0f0f0U);
+    n = ((uint16_t) (n >> 8U) & 0x00ff00ffU) | ((uint16_t) (n << 8U) & 0xff00ff00U);
+    // n = (n >> 16U) & 0x0000ffffU | (n << 16U) & 0xffff0000U;
+    return n;
+  }
+
+  //_____________________________________________________________
+  [[maybe_unused]] uint16_t crc16(const std::deque<uint16_t>& data, const unsigned int index, const int l)
+  {
+    uint16_t crc = 0xffffU;
+
+    for (int i = 0; i < l; i++)
+    {
+      uint16_t x = data[index + i];
+      crc ^= reverseBits(x);
+      for (uint16_t k = 0; k < 16; k++)
+      {
+        crc = crc & 1U ? (uint16_t) (crc >> 1U) ^ 0xa001U : crc >> 1U;
+      }
+    }
+    crc = reverseBits(crc);
+    return crc;
+  }
+
+  /// used to make sure buffer is properly cleared when leaving current scope
+  class buffer_cleaner_t
+  {
+   public:
+    buffer_cleaner_t(std::deque<uint16_t>& buffer, uint16_t pkt_length)
+      : m_buffer(buffer)
+      , m_pkt_length(pkt_length)
+    {
+    }
+
+    ~buffer_cleaner_t()
+    {
+      m_buffer.erase(m_buffer.begin(), m_buffer.begin() + m_pkt_length + 1);
+    }
+
+    //! deleted copy constructor
+    buffer_cleaner_t(const buffer_cleaner_t&) = delete;
+
+    //! deleted copy constructor
+    buffer_cleaner_t(buffer_cleaner_t&&) = delete;
+
+    //! assignment operator
+    buffer_cleaner_t& operator=(const buffer_cleaner_t&) = delete;
+
+    //! assignment operator
+    buffer_cleaner_t& operator=(buffer_cleaner_t&&) = delete;
+
+   private:
+    std::deque<uint16_t>& m_buffer;
+    uint16_t m_pkt_length;
+  };
+
+}  // namespace
+
+using MicromegasRawHit_impl = MicromegasRawHitv3;
+
+//______________________________________________________________
+SingleMicromegasPoolInput_v2::SingleMicromegasPoolInput_v2(const std::string& name)
+  : SingleStreamingInput(name)
+{
+  SubsystemEnum(InputManagerType::MICROMEGAS);
+  m_rawHitContainerName = "MICROMEGASRAWHIT";
+}
+
+//______________________________________________________________
+SingleMicromegasPoolInput_v2::~SingleMicromegasPoolInput_v2()
+{
+  std::cout << "SingleMicromegasPoolInput_v2::~SingleMicromegasPoolInput_v2 - runnumber: " << RunNumber() << std::endl;
+
+  if (m_evaluation_file && m_evaluation_tree)
+  {
+    m_evaluation_file->cd();
+    m_evaluation_tree->Write();
+    m_evaluation_file->Close();
+  }
+
+  // timer statistics
+  m_timer.print_stat();
+
+  // dropped GL1 statistics
+  for( const auto& [packet,found]:m_packet_stat.found_packet )
+  {
+    const auto& total = m_packet_stat.total;
+    const auto dropped = total-found;
+    const double dropped_fraction = double(dropped)/total;
+    std::cout << "SingleMicromegasPoolInput_v2::~SingleMicromegasPoolInput_v2 -"
+      << " packet: " << packet
+      << " gl1_bco_total: " << total
+      << " gl1_dropped: " << dropped
+      << " ratio_bco: " << dropped_fraction
+      << std::endl;
+  }
+  std::cout << std::endl;
+
+  // dropped waveforms
+  for (const auto& [packet, counter] : m_waveform_counters)
+  {
+    std::cout << "SingleMicromegasPoolInput_v2::~SingleMicromegasPoolInput_v2 -"
+              << " packet: " << packet
+              << " wf_total: " << counter.total
+              << " wf_dropped_bco: " << counter.dropped_bco
+              << " wf_dropped_pool: " << counter.dropped_pool
+              << " ratio_bco: " << counter.dropped_fraction_bco()
+              << " ratio_pool: " << counter.dropped_fraction_pool()
+              << std::endl;
+  }
+  std::cout << std::endl;
+
+  // dropped heartbeats
+  for (const auto& [packet, counter] : m_heartbeat_counters)
+  {
+    std::cout << "SingleMicromegasPoolInput_v2::~SingleMicromegasPoolInput_v2 -"
+              << " packet: " << packet
+              << " hb_total: " << counter.total
+              << " hb_dropped_bco: " << counter.dropped_bco
+              << " ratio_bco: " << counter.dropped_fraction_bco()
+              << std::endl;
+  }
+  std::cout << std::endl;
+
+  // drop per fee statistics
+  for (const auto& [fee, counter] : m_fee_waveform_counters)
+  {
+    std::cout << "SingleMicromegasPoolInput_v2::~SingleMicromegasPoolInput_v2 -"
+              << " fee: " << fee
+              << " wf_total: " << counter.total
+              << " wf_dropped_bco: " << counter.dropped_bco
+              << " ratio_bco: " << counter.dropped_fraction_bco()
+              << " ratio_pool: " << counter.dropped_fraction_pool()
+              << std::endl;
+  }
+  std::cout << std::endl;
+
+  // drop per fee statistics
+  for (const auto& [fee, counter] : m_fee_heartbeat_counters)
+  {
+    std::cout << "SingleMicromegasPoolInput_v2::~SingleMicromegasPoolInput_v2 -"
+              << " fee: " << fee
+              << " hb_total: " << counter.total
+              << " hb_dropped_bco: " << counter.dropped_bco
+              << " ratio_bco: " << counter.dropped_fraction_bco()
+              << std::endl;
+  }
+  std::cout << std::endl;
+
+  // also printout adjusted multipliers
+  for (const auto& [packet_id, bco_matching] : m_bco_matching_information_map)
+  {
+    const auto old_precision = std::cout.precision();
+    std::cout << "SingleMicromegasPoolInput_v2::~SingleMicromegasPoolInput_v2 -"
+              << " packet: " << packet_id
+              << " multiplier: " << std::setprecision(9) << bco_matching.get_adjusted_multiplier() << std::setprecision(old_precision)
+              << std::endl;
+  }
+}
+
+//______________________________________________________________
+void SingleMicromegasPoolInput_v2::FillPool(const uint64_t target_bco)
+{
+
+  if (AllDone())  // no more files and all events read
+  {
+    std::cout << "SingleMicromegasPoolInput_v2::FillPool - We are done." << std::endl;
+    return;
+  }
+
+  while (!GetEventiterator())  // at startup this is a null pointer
+  {
+    if (OpenNextFile() == InputFileHandlerReturnCodes::FAILURE)
+    {
+      AllDone(1);
+      return;
+    }
+  }
+
+  while( is_more_data_required(target_bco) )
+  {
+    std::unique_ptr<Event> evt(GetEventiterator()->getNextEvent());
+    while (!evt)
+    {
+      fileclose();
+      if (OpenNextFile() == InputFileHandlerReturnCodes::FAILURE)
+      {
+        AllDone(1);
+        return;
+      }
+
+      // get next event
+      evt.reset(GetEventiterator()->getNextEvent());
+    }
+
+    if (Verbosity() > 2)
+    {
+      std::cout << "Fetching next Event" << evt->getEvtSequence() << std::endl;
+    }
+
+    if (evt->getEvtType() != DATAEVENT)
+    {
+      m_NumSpecialEvents++;
+      continue;
+    }
+
+    RunNumber(evt->getRunNumber());
+    if (Verbosity() > 1)
+    {
+      evt->identify();
+    }
+
+    const int npackets = evt->getPacketList(plist.data(), 10);
+
+    if (npackets == 10)
+    {
+      std::cout << "SingleMicromegasPoolInput_v2::FillPool - too many packets" << std::endl;
+      exit(1);
+    }
+
+    m_timer.restart();
+    for (int i = 0; i < npackets; i++)
+    {
+      // keep pointer to local packet
+      std::unique_ptr<Packet> packet(plist[i]);
+
+      // process
+      process_packet(packet.get());
+    }
+
+    if (Verbosity() > 2)
+    {
+      for (size_t i = 0; i < m_feeData.size(); ++i)
+      {
+        std::cout << " SingleMicromegasPoolInput_v2::FillPool -"
+                  << " fee: " << i
+                  << " buffer size: " << m_feeData[i].size()
+                  << std::endl;
+      }
+    }
+
+    m_timer.stop();
+  }
+
+  if( m_do_evaluation )
+  { fill_evaluation_tree( target_bco ); }
+
+  // recover truncated FEEs for target bco
+  if( m_recover_truncated_waveforms ) { recover_truncated_waveforms( target_bco ); }
+
+}
+
+//______________________________________________________________
+void SingleMicromegasPoolInput_v2::Print(const std::string& what) const
+{
+  if (what == "ALL" || what == "FEE")
+  {
+    for (const auto& bcliter : m_BeamClockFEE)
+    {
+      std::cout << "Beam clock 0x" << std::hex << bcliter.first << std::dec << std::endl;
+      for (auto feeiter : bcliter.second)
+      {
+        std::cout << "FEM: " << feeiter << std::endl;
+      }
+    }
+  }
+}
+
+//____________________________________________________________________________
+void SingleMicromegasPoolInput_v2::CleanupUsedPackets(const uint64_t bclk, bool dropped)
+{
+  // delete all raw hits associated to bco smaller than reference, and remove from map
+  // loop over per-FEE maps
+  for( auto&& rawhitmap: m_MicromegasRawHitMap )
+  {
+    // loop over rawhit lists for which gtm bco is below request
+    // delete hits in list and remove list from map
+    for (auto iter = rawhitmap.begin(); iter != rawhitmap.end() && (iter->first <= bclk); iter = rawhitmap.erase(iter))
+    {
+      for (const auto& rawhit : iter->second)
+      {
+        // increment dropped waveform counters
+        if (dropped)
+        {
+          // increment dropped waveform counter and histogram
+          ++m_waveform_counters[rawhit->get_packetid()].dropped_pool;
+          ++m_fee_waveform_counters[rawhit->get_fee()].dropped_pool;
+          h_waveform_count_dropped_pool->Fill(std::to_string(rawhit->get_packetid()).c_str(), 1);
+          h_fee_waveform_count_dropped_pool->Fill(rawhit->get_fee(), 1);
+        }
+
+        // delete raw hit
+        delete rawhit;
+      }
+    }
+  }
+
+  // cleanup bco stacks
+  m_BeamClockFEE.erase(m_BeamClockFEE.begin(), m_BeamClockFEE.upper_bound(bclk));
+  m_BeamClockPacket.erase(m_BeamClockPacket.begin(), m_BeamClockPacket.upper_bound(bclk));
+
+  // cleanup matching information
+  for (auto&& bco_matching : m_bco_matching_information_map)
+  {
+    bco_matching.second.cleanup(bclk);
+  }
+}
+
+//_______________________________________________________
+void SingleMicromegasPoolInput_v2::ClearCurrentEvent()
+{
+  std::cout << "SingleTpcTimeFrameInput::ClearCurrentEvent() - deprecated " << std::endl;
+}
+
+//_______________________________________________________
+bool SingleMicromegasPoolInput_v2::is_more_data_required(const uint64_t target_bco) const
+{
+  if (AllDone())
+  {
+    return false;
+  }
+
+  if( m_bco_matching_information_map.empty() )
+  { return true; }
+
+  // correct target_bco by negative BCO and Tagger offset
+  const uint64_t target_bco_corrected = target_bco + m_NegativeBco + m_TaggerBcoOffset;
+  for( const auto& [packet, bco_matching_information]:m_bco_matching_information_map )
+  {
+    if( bco_matching_information.is_more_data_required( target_bco_corrected ) )
+    { return true; }
+  }
+
+  return false;
+}
+
+//_______________________________________________________
+void SingleMicromegasPoolInput_v2::CreateDSTNode(PHCompositeNode* topNode)
+{
+  PHNodeIterator iter(topNode);
+  auto* dstNode = dynamic_cast<PHCompositeNode*>(iter.findFirst("PHCompositeNode", "DST"));
+  if (!dstNode)
+  {
+    dstNode = new PHCompositeNode("DST");
+    topNode->addNode(dstNode);
+  }
+
+  PHNodeIterator iterDst(dstNode);
+  auto* detNode = dynamic_cast<PHCompositeNode*>(iterDst.findFirst("PHCompositeNode", "MICROMEGAS"));
+  if (!detNode)
+  {
+    detNode = new PHCompositeNode("MICROMEGAS");
+    dstNode->addNode(detNode);
+  }
+
+  auto* container = findNode::getClass<MicromegasRawHitContainer>(detNode, m_rawHitContainerName);
+  if (!container)
+  {
+    container = new MicromegasRawHitContainerv3;
+    auto* newNode = new PHIODataNode<PHObject>(container, m_rawHitContainerName, "PHObject");
+    detNode->addNode(newNode);
+  }
+}
+
+//_______________________________________________________
+void SingleMicromegasPoolInput_v2::ConfigureStreamingInputManager()
+{
+  if (StreamingInputManager())
+  {
+    StreamingInputManager()->SetMicromegasBcoRange(m_BcoRange);
+    StreamingInputManager()->SetMicromegasNegativeBco(m_NegativeBco);
+  }
+}
+
+//_______________________________________________________
+void SingleMicromegasPoolInput_v2::FillBcoQA(uint64_t gtm_bco)
+{
+  auto* hm = QAHistManagerDef::getHistoManager();
+  assert(hm);
+
+  // set of packets for which the gtm BCO is found at least once
+  unsigned int n_waveforms = 0;
+  std::set<int> found_packets;
+  for (uint64_t gtm_bco_loc = gtm_bco - m_NegativeBco; gtm_bco_loc < gtm_bco + m_BcoRange - m_NegativeBco; ++gtm_bco_loc)
+  {
+    // packet ids
+    const auto packet_iter = m_BeamClockPacket.find(gtm_bco_loc);
+    if (packet_iter != m_BeamClockPacket.end())
+    {
+      found_packets.insert(packet_iter->second.begin(), packet_iter->second.end());
+    }
+
+    // waveforms
+    // loop over FEEs, find gtm bco and increment by number of rawhits in corresponding list
+    for( const auto& rawhitmap:m_MicromegasRawHitMap )
+    {
+      const auto wf_iter = rawhitmap.find(gtm_bco_loc);
+      if (wf_iter != rawhitmap.end())
+      { n_waveforms += wf_iter->second.size(); }
+    }
+  }
+
+  // per packet statistics
+  h_packet_stat->Fill("Reference", 1);
+  ++m_packet_stat.total;
+
+  for (const auto& packet_id : found_packets)
+  {
+    h_packet_stat->Fill(std::to_string(packet_id).c_str(), 1);
+    ++m_packet_stat.found_packet[packet_id];
+  }
+
+  if( found_packets.size() >= m_npackets_active )
+  {
+    h_packet_stat->Fill("All", 1);
+    ++m_packet_stat.found_all;
+  }
+
+  // how many packet_id found for this BCO
+  h_packet->Fill(found_packets.size());
+
+  // how many waveforms found for this BCO
+  h_waveform->Fill(n_waveforms);
+}
+
+//_______________________________________________________
+void SingleMicromegasPoolInput_v2::createQAHistos()
+{
+  auto* hm = QAHistManagerDef::getHistoManager();
+  assert(hm);
+
+  // number of packets found with BCO from felix matching reference BCO
+  h_packet = new TH1D("h_MicromegasBCOQA_npacket_bco", "TPOT Packet Count per GTM BCO; Matching BCO tagger count; GL1 trigger count", 10, 0, 10);
+
+  // number of waveforms found with BCO from felix matching reference BCO
+  h_waveform = new TH1D("h_MicromegasBCOQA_nwaveform_bco", "TPOT Waveform Count per GTM BCO; Matching Waveform count; GL1 trigger count", 4100, 0, 4100);
+
+  /*
+   * first bin is the number of requested GL1 BCO, for reference
+   * next two bins is the number of times the GL1 BCO is found in the taggers list for a given packet_id
+   * last bin is the sum
+   */
+  h_packet_stat = new TH1D("h_MicromegasBCOQA_packet_stat", "Matching Tagger count per packet; packet id; GL1 trigger count", m_npackets_active + 2, 0, m_npackets_active + 2);
+  h_packet_stat->GetXaxis()->SetBinLabel(1, "Reference");
+  h_packet_stat->GetXaxis()->SetBinLabel(2, "5001");
+  h_packet_stat->GetXaxis()->SetBinLabel(3, "5002");
+  h_packet_stat->GetXaxis()->SetBinLabel(4, "All");
+
+  /*
+   * first two bins is the number of heartbeat MODEBITS are received from the GTM, per packet
+   * next bins are how many heartbeat packets are recieved from the FEEs on a per sampa basis
+   */
+  h_heartbeat_stat = new TH1D(
+      "h_MicromegasBCOQA_heartbeat_stat", "Heartbeat count per SAMPA; sampa id; heartbeat count",
+      m_npackets_active + m_nfee_max * m_nsampa_fee, 0, m_npackets_active + m_nfee_max * m_nsampa_fee);
+  h_heartbeat_stat->GetXaxis()->SetBinLabel(1, "5001");
+  h_heartbeat_stat->GetXaxis()->SetBinLabel(2, "5002");
+
+  // total number of waveform per packet
+  h_waveform_count_total = new TH1D("h_MicromegasBCOQA_waveform_count_total", "Total number of waveforms per packet", m_npackets_active, 0, m_npackets_active);
+
+  // number of dropped waveform per packet due to bco mismatch
+  h_waveform_count_dropped_bco = new TH1D("h_MicromegasBCOQA_waveform_count_dropped_bco", "Number of dropped waveforms per packet (bco)", m_npackets_active, 0, m_npackets_active);
+
+  // number of dropped waveform per packet due to fun4all pool mismatch
+  h_waveform_count_dropped_pool = new TH1D("h_MicromegasBCOQA_waveform_count_dropped_pool", "Number of dropped waveforms per packet (pool)", m_npackets_active, 0, m_npackets_active);
+
+  // total number of waveform per packet
+  h_fee_waveform_count_total = new TH1D("h_MicromegasBCOQA_fee_waveform_count_total", "Total number of waveforms per fee", m_nfee_max, 0, m_nfee_max);
+
+  // number of dropped waveform per fee due to bco mismatch
+  h_fee_waveform_count_dropped_bco = new TH1D("h_MicromegasBCOQA_fee_waveform_count_dropped_bco", "Number of dropped waveforms per fee (bco)", m_nfee_max, 0, m_nfee_max);
+
+  // number of dropped waveform per fee due to fun4all pool mismatch
+  h_fee_waveform_count_dropped_pool = new TH1D("h_MicromegasBCOQA_fee_waveform_count_dropped_pool", "Number of dropped waveforms per fee (pool)", m_nfee_max, 0, m_nfee_max);
+
+  // define axis
+  for (const auto& h : std::initializer_list<TH1*>{h_waveform_count_total, h_waveform_count_dropped_bco, h_waveform_count_dropped_pool})
+  {
+    h->GetXaxis()->SetBinLabel(1, "5001");
+    h->GetXaxis()->SetBinLabel(2, "5002");
+    h->GetYaxis()->SetTitle("waveform count");
+    h->GetXaxis()->SetTitle("packet id");
+  }
+
+  for (const auto& h : std::initializer_list<TH1*>{h_fee_waveform_count_total, h_fee_waveform_count_dropped_bco, h_fee_waveform_count_dropped_pool})
+  {
+    h->GetYaxis()->SetTitle("waveform count");
+    h->GetXaxis()->SetTitle("FEE id");
+  }
+
+  // register all histograms to histogram manager
+  for (const auto& h : std::initializer_list<TH1*>{
+           h_packet, h_waveform, h_packet_stat, h_heartbeat_stat,
+           h_waveform_count_total, h_waveform_count_dropped_bco, h_waveform_count_dropped_pool,
+           h_fee_waveform_count_total, h_fee_waveform_count_dropped_bco, h_fee_waveform_count_dropped_pool})
+  {
+    h->SetFillStyle(1001);
+    h->SetFillColor(kYellow);
+    hm->registerHisto(h);
+  }
+
+  // also create evaluation trees
+  if (m_do_evaluation)
+  {
+    m_evaluation_file.reset(new TFile(m_evaluation_filename.c_str(), "RECREATE"));
+    m_evaluation_tree = new TTree("T", "T");
+    m_evaluation_tree->Branch("packet_id", &m_waveform.packet_id);
+    m_evaluation_tree->Branch("fee_id", &m_waveform.fee_id);
+    m_evaluation_tree->Branch("channel", &m_waveform.channel);
+
+    m_evaluation_tree->Branch("gtm_bco_first", &m_waveform.gtm_bco_first);
+    m_evaluation_tree->Branch("gtm_bco_tagger", &m_waveform.gtm_bco_tagger);
+    m_evaluation_tree->Branch("gtm_bco_gl1", &m_waveform.gtm_bco_gl1);
+
+    m_evaluation_tree->Branch("fee_bco_first", &m_waveform.fee_bco_first);
+    m_evaluation_tree->Branch("fee_bco", &m_waveform.fee_bco);
+    m_evaluation_tree->Branch("fee_bco_predicted_tagger", &m_waveform.fee_bco_predicted_tagger);
+    m_evaluation_tree->Branch("fee_bco_predicted_gl1", &m_waveform.fee_bco_predicted_gl1);
+  }
+}
+
+//__________________________________________________________________________________
+void SingleMicromegasPoolInput_v2::process_packet(Packet* packet)
+{
+  // check hit format
+  const auto hitformat = packet->getHitFormat();
+  if (hitformat != IDTPCFEEV4 && hitformat != IDTPCFEEV5)
+  {
+    return;
+  }
+
+  // set clock multipliers if not alsready
+  if (!MicromegasBcoMatchingInformation_v2::gtm_clock_multiplier_is_set())
+  {
+    switch (hitformat)
+    {
+    case IDTPCFEEV4:
+      std::cout << "SingleMicromegasPoolInput_v2::process_packet - hitformat: IDTPCFEEV4" << std::endl;
+      MicromegasBcoMatchingInformation_v2::set_gtm_clock_multiplier(4.262916255);
+      break;
+
+    case IDTPCFEEV5:
+      std::cout << "SingleMicromegasPoolInput_v2::process_packet - hitformat: IDTPCFEEV5" << std::endl;
+      MicromegasBcoMatchingInformation_v2::set_enable_multiplier_adjustment(false);
+      MicromegasBcoMatchingInformation_v2::set_gtm_clock_multiplier(30. / 8);
+      break;
+
+    default:
+      break;
+    }
+  }
+
+  // get packet id
+  const int packet_id = packet->getIdentifier();
+
+  // get relevant bco matching information and initialize
+  auto& bco_matching_information = m_bco_matching_information_map[packet_id];
+  bco_matching_information.set_verbosity(Verbosity());
+
+  // decode
+  const int data_length = packet->getDataLength();  // 32bit length
+  const int data_padding = packet->getPadding();    // 32bit padding
+
+  // maximum number of dma words
+  const size_t dma_words_buffer = static_cast<unsigned long>(data_length) * 2 / DAM_DMA_WORD_LENGTH + 1;
+
+  // dma words
+  std::vector<dma_word> buffer(dma_words_buffer);
+
+  int l2 = 0;
+  packet->fillIntArray(reinterpret_cast<int*>(buffer.data()), data_length + DAM_DMA_WORD_LENGTH / 2, &l2, "DATA");
+
+  // sanity checks
+  assert(l2 <= data_length);
+
+  // sanity checks
+  l2 -= data_padding;
+  assert(l2 >= 0);
+
+  // actual number of dma words
+  const size_t dma_words = static_cast<unsigned long>(l2) * 2 / DAM_DMA_WORD_LENGTH;
+  assert(dma_words <= buffer.size());
+
+  // demultiplexer
+  for (size_t index = 0; index < dma_words; ++index)
+  {
+    const auto& dma_word_data = buffer[index];
+
+    if ((dma_word_data.dma_header & 0xFF00U) == GTM_MAGIC_KEY)
+    {
+      // decode gtm data
+      decode_gtm_data(packet_id, dma_word_data);
+    }
+    else if ((dma_word_data.dma_header & 0xFF00U) == FEE_MAGIC_KEY)
+    {
+      // decode fee data
+      // get fee id
+      const unsigned int fee_id = dma_word_data.dma_header & 0xffU;
+
+      // populate fee buffer
+      if (fee_id < MAX_FEECOUNT)
+      {
+
+        // update FEE packet ID
+        m_fee_packet[fee_id] = packet_id;
+
+        // NOLINTNEXTLINE(modernize-loop-convert)
+        for (unsigned int i = 0; i < DAM_DMA_WORD_LENGTH - 1; i++)
+        {
+          m_feeData[fee_id].push_back(dma_word_data.data[i]);
+        }
+
+        // immediate fee buffer processing to reduce memory consuption
+        process_fee_data(packet_id, fee_id);
+
+      }
+    }
+  }
+}
+
+//____________________________________________________________________
+void SingleMicromegasPoolInput_v2::decode_gtm_data(int packet_id, const SingleMicromegasPoolInput_v2::dma_word& gtm_word)
+{
+  const unsigned char* gtm = reinterpret_cast<const unsigned char*>(&gtm_word);
+  MicromegasBcoMatchingInformation_v2::gtm_payload payload;
+
+  payload.pkt_type = gtm[0] | (unsigned short) (gtm[1] << 8U);
+
+  // check packet type
+  if (payload.pkt_type != GTM_LVL1_ACCEPT_MAGIC_KEY &&
+      payload.pkt_type != GTM_ENDAT_MAGIC_KEY &&
+      payload.pkt_type != GTM_MODEBIT_MAGIC_KEY)
+  {
+    return;
+  }
+
+  payload.is_lvl1 = payload.pkt_type == GTM_LVL1_ACCEPT_MAGIC_KEY;
+  payload.is_endat = payload.pkt_type == GTM_ENDAT_MAGIC_KEY;
+  payload.is_modebit = payload.pkt_type == GTM_MODEBIT_MAGIC_KEY;
+
+  payload.bco = ((unsigned long long) gtm[2] << 0U) | ((unsigned long long) gtm[3] << 8U) | ((unsigned long long) gtm[4] << 16U) | ((unsigned long long) gtm[5] << 24U) | ((unsigned long long) gtm[6] << 32U) | (((unsigned long long) gtm[7]) << 40U);
+  payload.lvl1_count = ((unsigned int) gtm[8] << 0U) | ((unsigned int) gtm[9] << 8U) | ((unsigned int) gtm[10] << 16U) | ((unsigned int) gtm[11] << 24U);
+  payload.endat_count = ((unsigned int) gtm[12] << 0U) | ((unsigned int) gtm[13] << 8U) | ((unsigned int) gtm[14] << 16U) | ((unsigned int) gtm[15] << 24U);
+  payload.last_bco = ((unsigned long long) gtm[16] << 0U) | ((unsigned long long) gtm[17] << 8U) | ((unsigned long long) gtm[18] << 16U) | ((unsigned long long) gtm[19] << 24U) | ((unsigned long long) gtm[20] << 32U) | (((unsigned long long) gtm[21]) << 40U);
+  payload.modebits = gtm[22];
+  payload.userbits = gtm[23];
+
+  // fill per packet heartbeat statistics
+  const bool is_heartbeat = payload.modebits & (1U << ELINK_HEARTBEAT_T);
+  if (is_heartbeat)
+  {
+    h_heartbeat_stat->Fill(std::to_string(packet_id).c_str(), 1);
+  }
+
+  // save bco information
+  auto& bco_matching_information = m_bco_matching_information_map[packet_id];
+  bco_matching_information.save_gtm_bco_information(packet_id, payload);
+
+  if (payload.is_lvl1 || payload.is_endat)
+  {
+    const auto& gtm_bco = payload.bco;
+    m_BeamClockPacket[gtm_bco].insert(packet_id);
+  }
+
+  // find reference from modebits, using BX_COUNTER_SYNC_T
+  /*
+   * This needs to be done even if the bco matching information is already verified
+   * because any BX_COUNTER_SYNC_T event will break past references
+   */
+  bco_matching_information.find_reference_from_modebits(payload);
+}
+
+//____________________________________________________________________
+void SingleMicromegasPoolInput_v2::process_fee_data(int packet_id, unsigned int fee_id)
+{
+  // get bco information
+  auto& bco_matching_information = m_bco_matching_information_map[packet_id];
+
+  // get fee buffer
+  assert(fee_id < m_feeData.size());
+  auto& data_buffer = m_feeData[fee_id];
+
+  // process header
+  while (HEADER_LENGTH <= data_buffer.size())
+  {
+    // packet loop
+    /* question: why check index [1] ? */
+    if (data_buffer[1] != FEE_PACKET_MAGIC_KEY_1)
+    {
+      if (Verbosity())
+      {
+        std::cout << "SingleMicromegasPoolInput_v2::process_fee_data - Invalid FEE magic key at position 1 0x" << std::hex << data_buffer[1] << std::dec << std::endl;
+      }
+      data_buffer.pop_front();
+      continue;
+    }
+
+    if (data_buffer[2] != FEE_PACKET_MAGIC_KEY_2)
+    {
+      if (Verbosity())
+      {
+        std::cout << "SingleMicromegasPoolInput_v2::process_fee_data - Invalid FEE magic key at position 2 0x" << std::hex << data_buffer[2] << std::dec << std::endl;
+      }
+      data_buffer.pop_front();
+      continue;
+    }
+
+    // packet length
+    // number of 10-bit words + 5 in this packet
+    const uint16_t& pkt_length = data_buffer[0];
+    if (pkt_length > MAX_PACKET_LENGTH)
+    {
+      if (Verbosity())
+      {
+        std::cout << "SingleMicromegasPoolInput_v2::process_fee_data - Invalid FEE pkt_length " << pkt_length << std::endl;
+      }
+      data_buffer.pop_front();
+      continue;
+    }
+
+    // compare to data size
+    if (pkt_length + 1U > data_buffer.size())
+    {
+      // not enough data. will wait for more
+      break;
+    }
+
+    // create payload
+    MicromegasBcoMatchingInformation_v2::fee_payload payload;
+
+    // number of 10-bit words in this packet
+    payload.adc_length = data_buffer[0] - HEADER_LENGTH;
+    payload.data_parity = data_buffer[4] >> 9U;
+    payload.sampa_address = (uint16_t) (data_buffer[4] >> 5U) & 0xfU;
+    payload.sampa_channel = data_buffer[4] & 0x1fU;
+    payload.channel = data_buffer[4] & 0x1ffU;
+    payload.type = (uint16_t) (data_buffer[3] >> 7U) & 0x7U;
+    payload.user_word = data_buffer[3] & 0x7fU;
+    payload.bx_timestamp = (uint32_t) ((data_buffer[6] & 0x3ffU) << 10U) | (data_buffer[5] & 0x3ffU);
+
+    // fill heartbeat statistics
+    const bool is_heartbeat(payload.type == HEARTBEAT_T);
+    if (is_heartbeat)
+    {
+      const int sampa_id = payload.sampa_address + fee_id * m_nsampa_fee;
+      h_heartbeat_stat->Fill(sampa_id + 2);
+    }
+
+    // increment number of waveforms
+    ++m_waveform_counters[packet_id].total;
+    ++m_fee_waveform_counters[fee_id].total;
+    h_waveform_count_total->Fill(std::to_string(packet_id).c_str(), 1);
+    h_fee_waveform_count_total->Fill(fee_id, 1);
+
+    if (is_heartbeat)
+    {
+      ++m_heartbeat_counters[packet_id].total;
+      ++m_fee_heartbeat_counters[fee_id].total;
+    }
+
+    // crc
+    payload.data_crc = data_buffer[pkt_length];
+    // payload.calc_crc = crc16(data_buffer, 0, pkt_length);
+
+    // make sure buffer is cleaned as soon as we exit current scope
+    /*
+     * the buffer is cleared when buffer_cleaner is deleted, that is, as soon as it becomes out of scope
+     * this allows to use the various 'continue' statements below, without having to care about the buffer being properly cleared
+     */
+    [[maybe_unused]] buffer_cleaner_t buffer_cleaner(data_buffer, pkt_length);
+
+    // check bco matching information
+    if (!bco_matching_information.is_verified())
+    {
+      bco_matching_information.find_reference_from_data(payload);
+    }
+
+    // if bco matching information is still not verified, drop the packet
+    if (!bco_matching_information.is_verified())
+    {
+      ++m_waveform_counters[packet_id].dropped_bco;
+      ++m_fee_waveform_counters[fee_id].dropped_bco;
+      h_waveform_count_dropped_bco->Fill(std::to_string(packet_id).c_str(), 1);
+      h_fee_waveform_count_dropped_bco->Fill(fee_id, 1);
+
+      if (is_heartbeat)
+      {
+        ++m_heartbeat_counters[packet_id].dropped_bco;
+        ++m_fee_heartbeat_counters[fee_id].dropped_bco;
+      }
+
+      continue;
+    }
+
+    // try get gtm bco matching fee
+    const auto& fee_bco = payload.bx_timestamp;
+
+    // find matching gtm bco
+    uint64_t gtm_bco = 0;
+    const auto result = bco_matching_information.find_gtm_bco(packet_id, fee_id, fee_bco);
+    if (result)
+    {
+      // assign gtm bco
+      gtm_bco = result.value();
+
+    } else {
+
+      // increment counter and histogram
+      ++m_waveform_counters[packet_id].dropped_bco;
+      ++m_fee_waveform_counters[fee_id].dropped_bco;
+      h_waveform_count_dropped_bco->Fill(std::to_string(packet_id).c_str(), 1);
+      h_fee_waveform_count_dropped_bco->Fill(fee_id, 1);
+
+      if (is_heartbeat)
+      {
+        ++m_heartbeat_counters[packet_id].dropped_bco;
+        ++m_fee_heartbeat_counters[fee_id].dropped_bco;
+      }
+
+      // skip the waverform
+      continue;
+    }
+
+    // ignore heartbeat waveforms
+    if (is_heartbeat)
+    {
+      continue;
+    }
+
+    // store data from string
+    // Format is (N sample) (start time), (1st sample)... (Nth sample)
+    size_t pos = HEADER_LENGTH;
+    while (pos < pkt_length)
+    {
+      const uint16_t& samples = data_buffer[pos++];
+      const uint16_t& start_t = data_buffer[pos++];
+      if (pos + samples > size_t(pkt_length))
+      {
+        if (Verbosity())
+        {
+          std::cout
+            << "SingleMicromegasPoolInput_v2::process_fee_data -"
+            << " samples: " << samples
+            << " pos: " << pos
+            << " pkt_length: " << pkt_length
+            << " format error"
+            << std::endl;
+        }
+        break;
+      }
+
+      std::vector<uint16_t> adc(samples);
+      for (int i = 0; i < samples; ++i)
+      {
+        adc[i] = data_buffer[pos++];
+      }
+
+      // add
+      payload.waveforms.emplace_back(start_t, std::move(adc));
+    }
+
+    // create new hit
+    auto newhit = std::make_unique<MicromegasRawHit_impl>();
+    newhit->set_bco(fee_bco);
+    newhit->set_gtm_bco(gtm_bco);
+
+    // packet id, fee id, channel, etc.
+    newhit->set_packetid(packet_id);
+    newhit->set_fee(fee_id);
+    newhit->set_channel(payload.channel);
+    newhit->set_sampaaddress(payload.sampa_address);
+    newhit->set_sampachannel(payload.sampa_channel);
+
+    // adc values
+    for (auto&& [start_t, adc] : payload.waveforms)
+    {
+      newhit->move_adc_waveform(start_t, std::move(adc));
+    }
+
+    m_BeamClockFEE[gtm_bco].insert(fee_id);
+
+    // add hit to streaming input manager
+    if (StreamingInputManager())
+    { StreamingInputManager()->AddMicromegasRawHit(gtm_bco, newhit.get()); }
+
+    // add to local map
+    m_MicromegasRawHitMap[fee_id][gtm_bco].emplace_back(newhit.release());
+  }
+}
+
+//____________________________________________________________________
+void SingleMicromegasPoolInput_v2::fill_evaluation_tree( const uint64_t target_bco )
+{
+
+  // loop over fees
+  for( size_t fee = 0; fee < MAX_FEECOUNT; ++fee )
+  {
+
+    // get local raw hitmap
+    auto&& rawhitmap = m_MicromegasRawHitMap[fee];
+    if( rawhitmap.empty() ) { continue; }
+
+    // get the relevant BCO matching information object
+    const auto& bco_matching_information = m_bco_matching_information_map.at( m_fee_packet[fee] );
+    if( !bco_matching_information.is_verified() )
+    { continue; }
+
+    m_waveform.packet_id = m_fee_packet[fee];
+    m_waveform.fee_id = fee;
+    m_waveform.gtm_bco_first = bco_matching_information.get_bco_matching_reference().second;
+    m_waveform.fee_bco_first = bco_matching_information.get_bco_matching_reference().first;
+
+    // assign target bco and prediction
+    m_waveform.gtm_bco_gl1 = target_bco;
+
+    // get prediction
+    const uint64_t target_bco_corrected = target_bco + m_NegativeBco + m_TaggerBcoOffset;
+    m_waveform.fee_bco_predicted_gl1 = bco_matching_information.get_predicted_fee_bco(target_bco_corrected).value();
+
+    // find matching bco if any and store raw hits
+    // list of raw hits (channel ordered) matching target BCO
+    for( auto&& [bco, rawhitlist]:rawhitmap )
+    {
+
+      // compare bco to target, within acceptable range
+      const auto bco_diff = MicromegasBcoMatchingInformation_v2::get_signed_gtm_bco_diff( bco, target_bco_corrected );
+      if( bco_diff >= -(int64_t)m_NegativeBco && bco_diff < m_BcoRange )
+      {
+
+        // assign found bco and prediction
+        m_waveform.gtm_bco_tagger = bco;
+        m_waveform.fee_bco_predicted_tagger = bco_matching_information.get_predicted_fee_bco(bco).value();
+        for( auto&& rawhit:rawhitlist )
+        {
+          m_waveform.channel = rawhit->get_channel();
+          m_waveform.fee_bco = rawhit->get_bco();
+          m_evaluation_tree->Fill();
+        }
+        break;
+      }
+    }
+
+  } // FEE loop
+}
+
+//____________________________________________________________________
+void SingleMicromegasPoolInput_v2::recover_truncated_waveforms( const uint64_t target_bco )
+{
+
+  // TODO: consolidate everything (ahah)
+
+  static constexpr int32_t kTruncatedWaveformWindow = 1024U;
+  static constexpr int32_t kFEEClockPerADCClock = 2U;
+  static constexpr int32_t kTruncatedWaveformFEEWindow = kTruncatedWaveformWindow*kFEEClockPerADCClock;
+
+  // keep track of exact BCO
+  const uint64_t target_bco_corrected = target_bco + m_NegativeBco + m_TaggerBcoOffset;
+  uint64_t found_bco = target_bco_corrected;
+
+  // loop over fees
+  for( size_t fee = 0; fee < MAX_FEECOUNT; ++fee )
+  {
+
+    // get local raw hitmap
+    using rawhit_array_t = std::array<MicromegasRawHit*, MAX_FEECHANNELCOUNT>;
+    auto&& rawhitmap = m_MicromegasRawHitMap[fee];
+    if( rawhitmap.empty() ) { continue; }
+
+    // get the relevant BCO matching information object
+    const auto& bco_matching_information = m_bco_matching_information_map.at( m_fee_packet[fee] );
+
+    // do nothing if bco_matching_information is not verified
+    if( !bco_matching_information.is_verified() ) { continue; }
+
+    const double truncatedWaveformGTMWindow = kTruncatedWaveformFEEWindow/bco_matching_information.get_adjusted_multiplier();
+
+    // find matching bco if any and store raw hits
+    // list of raw hits (channel ordered) matching target BCO
+    rawhit_array_t current_rawhits{};
+    for( auto&& [bco, rawhitlist]:rawhitmap )
+    {
+
+      // compare bco to target, within acceptable range
+      const auto bco_diff = MicromegasBcoMatchingInformation_v2::get_signed_gtm_bco_diff( bco, target_bco_corrected );
+      if( bco_diff >= -(int64_t)m_NegativeBco && bco_diff < m_BcoRange )
+      {
+        found_bco = bco;
+        if( Verbosity() )
+        {
+          std::cout << "SingleMicromegasPoolInput_v2::recover_truncated_waveforms -"
+            << " fee: " << fee
+            << " target_bco: " << target_bco
+            << " found_bco: " << found_bco
+            << std::endl;
+        }
+
+        for( auto&& rawhit:rawhitlist )
+        {
+          if( rawhit->get_channel() < MAX_FEECHANNELCOUNT )
+          { current_rawhits[rawhit->get_channel()] = rawhit; }
+        }
+
+        break;
+      }
+    }
+
+    // keep track of newly created hits
+    using rawhit_impl_pointer_t = std::unique_ptr<MicromegasRawHit_impl>; // unique_ptr to raw hit implementation object
+    using rawhit_impl_array_t = std::array<rawhit_impl_pointer_t, MAX_FEECHANNELCOUNT>; // fixed size array of the above
+    rawhit_impl_array_t new_rawhits{};
+
+    // find candidate overlapping bco if any
+    for( auto&& [bco, rawhitlist]:rawhitmap )
+    {
+      const auto bco_diff = MicromegasBcoMatchingInformation_v2::get_signed_gtm_bco_diff( bco, target_bco_corrected );
+      if( bco_diff >= m_BcoRange && bco_diff < truncatedWaveformGTMWindow )
+      {
+
+        if( Verbosity() )
+        {
+          std::cout << "SingleMicromegasPoolInput_v2::recover_truncated_waveforms -"
+            << " fee: " << fee
+            << " target_bco: " << target_bco
+            << " found_bco: " << found_bco
+            << " overlaping bco: " << bco
+            << std::endl;
+        }
+
+        // perform overlap restoration
+        for( auto* source:rawhitlist )
+        {
+
+          // cast to versioned raw hit
+          auto* source_impl = static_cast<MicromegasRawHit_impl*>(source);
+
+          // get channel and check
+          const auto channel = source->get_channel();
+          if( channel >= MAX_FEECHANNELCOUNT ) { continue; }
+
+          // keep track of target hit
+          MicromegasRawHit_impl* target = nullptr;
+
+          // check if there is an existing raw hit in current BCO at the same channel
+          if( current_rawhits[channel] )
+          {
+
+            // cast to versioned raw hit
+            target = static_cast<MicromegasRawHit_impl*>(current_rawhits[channel]);
+
+          } else {
+
+            // get FEE BCO from GTM
+            const auto target_fee_bco = bco_matching_information.get_predicted_fee_bco( target_bco_corrected ).value();
+
+            // create new hit with shifted waveform
+            target = new MicromegasRawHit_impl;
+
+            // copy relevant members from source
+            target->set_bco(target_fee_bco);
+            target->set_gtm_bco(source->get_gtm_bco());
+            target->set_packetid(source->get_packetid());
+            target->set_fee(source->get_fee());
+            target->set_channel(source->get_channel());
+            target->set_sampaaddress(source->get_sampaaddress());
+            target->set_sampachannel(source->get_sampachannel());
+
+            // store in new array
+            new_rawhits[target->get_channel()].reset(target);
+
+          }
+
+          // calculate waveform shift
+          // TODO: get proper diff with proper rollover
+          const int64_t fee_bco_diff = MicromegasBcoMatchingInformation_v2::get_signed_fee_bco_diff( source->get_bco(), target->get_bco() );
+          const int16_t fee_clock_shift = static_cast<int16_t>(fee_bco_diff/kFEEClockPerADCClock);
+
+          // get waveforms (copy)
+          auto waveformlist = source_impl->get_adc_waveforms();
+
+          // move copy to target hit, with properly shifted start time
+          for( auto&& [start_time,adc_list]:waveformlist)
+          {
+
+            // make sure shifted start time is in acceptable window
+            if( start_time+fee_clock_shift >= kTruncatedWaveformWindow ) continue;
+
+            // make sure all samples are in acceptable range
+            if( start_time+fee_clock_shift + adc_list.size() >  kTruncatedWaveformWindow )
+            { adc_list.resize( kTruncatedWaveformWindow - start_time - fee_clock_shift ); }
+
+            target->move_adc_waveform( start_time+fee_clock_shift, std::move(adc_list) );
+
+          }
+
+        }
+
+        // found overlapping BCO. stop here
+        break;
+      }
+    }
+
+    // copy new hits in internal storage and add to streaming manager
+    for( auto&& rawhit:new_rawhits )
+    {
+      if( rawhit && !rawhit->get_adc_waveforms().empty() )
+      {
+        // add hit to streaming input manager
+        if (StreamingInputManager())
+        { StreamingInputManager()->AddMicromegasRawHit(found_bco, rawhit.get()); }
+
+        // add hit to insternal storage
+        m_MicromegasRawHitMap[fee][found_bco].emplace_back(rawhit.release());
+      }
+    }
+
+  } // FEE loop
+
+}
