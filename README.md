@@ -1,3 +1,3 @@
 # InttDataRecovery
-Repository for INTT data recovery process caused by 16 bits word shifting
+Repository for INTT 16 bits word shifting correction
 Test
